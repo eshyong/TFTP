@@ -13,13 +13,43 @@ OP_DATA  = "\3"
 OP_ACK   = "\4"
 OP_ERROR = "\5"
 
-# Request types
+# Error codes
+UNDEF_ERR     = 0
+NOT_FOUND_ERR = 1
+ACCESS_ERR    = 2
+DISK_FULL_ERR = 3
+ILLEGAL_ERR   = 4
+TID_ERR       = 5
+EXISTS_ERR    = 6
+USER_ERR      = 7
+
+# Strings
+OP_STRINGS = ["NULL", 
+              "READ REQUEST", 
+              "WRITE REQUEST", 
+              "DATA", 
+              "ACK", 
+              "ERROR"]
+
+ERROR_MSGS = ["\0\5\0\0Not implemented.\0", 
+              "\0\5\0\1File not found.\0", 
+              "\0\5\0\2Access violation.\0", 
+              "\0\5\0\3Disk full or allocation exceeded.\0", 
+              "\0\5\0\4Illegal tftp operation.\0",
+              "\0\5\0\5Unknown transfer ID.\0",
+              "\0\5\0\6File already exists.\0",
+              "\0\5\0\7No such user.\0"]
+
+DATA_PACKET = "\0\3{0}{1}{2}"
+ACK_PACKET  = "\0\4{0}{1}"
+
+# Client types
 RRQ = 1
 WRQ = 2
 
 class TFTPServer:
-    """Constructor."""
     def __init__(self, ipaddr=DEFAULT_IP, port=DEFAULT_PORT, root=DEFAULT_ROOT):
+        """Constructor"""
         # IP information.
         self.ipaddr = ipaddr
         self.port = port
@@ -39,20 +69,6 @@ class TFTPServer:
             data, addr = self.sock.recvfrom(1024)
             self.dispatch(data, addr)
 
-    def send_block(self, read_obj, last_received=-1):
-        current_blockno = read_obj.blockno
-        if current_blockno == last_received:
-            # Send each block in order.
-            read_obj.incr_blockno()
-
-        # Get next block and read request's address.
-        address = read_obj.address
-        next_block = read_obj.get_nextblock()
-        if next_block is not None:
-            payload = OP_NULL + OP_DATA + OP_NULL + chr(current_blockno) + next_block
-            print "sending payload: ", list(payload)
-            self.sock.sendto(payload, address)
-
     def dispatch(self, data, address):
         """Given a packet and an address, dispatches to the correct function call.
            Will pick the appropriate action to be taken for Read, Write, Data, Ack, and 
@@ -60,79 +76,109 @@ class TFTPServer:
         if len(data) < 4:
             print("request length too short")
 
-        addr_string = address[0] + ":" + str(address[1])
-        print "raw request: ", list(data)
+        addr_string = repr(address)
+        print "\nraw packet: ", list(data)
 
         # Figure out what the request was, and handle it accordingly.
         # Ignore first byte (it's irrelevant anyway)
         opcode = data[1]
+        print "{} received from {}".format(OP_STRINGS[ord(opcode)], addr_string)
         if opcode == OP_READ:
-            print "read request received from " + addr_string
-            payload = data[2:].split("\0")
-            file_name = self.root + "/" + payload[0]
-            file_format = payload[1]
-            try: 
-                # Try opening file and creating a read request object.
-                # TODO: Depending on file length, we can read the whole file in at once or 
-                # just pass in a file object.
-
-                # Open file and read into a buffer.
-                file_object = open(file_name, 'r')
-                file_buffer = file_object.read()
-                file_object.close()
-
-                # Create a request object.
-                read_req = RequestObject(address, file_buffer, RRQ)
-                if addr_string in self.clients:
-                    self.clients.pop(addr_string, None)
-                self.clients[addr_string] = read_req
-                self.send_block(read_req)
-            except (IOError, OSError) as e:
-                # Print out our error and send an ERROR response.
-                print e
-                self.sock.sendto("\0\5\0\1file not found\0", address)
+            header = data[2:].split(OP_NULL)
+            self.create_readclient(address, header)
         elif opcode == OP_WRITE:
-            print "write request received from " + addr_string
+            error_msg = ERROR_MSGS[UNDEF_ERR]
+            self.sock.sendto(error_msg, address)
         elif opcode == OP_DATA:
-            print "data received from " + addr_string
+            error_msg = ERROR_MSGS[UNDEF_ERR]
+            self.sock.sendto(error_msg, address)
         elif opcode == OP_ACK:
-            print "ack received from " + addr_string
-            # Check if ACK is for a current request.
             if addr_string in self.clients:
-                req_obj = self.clients[addr_string]
-                last_received = (ord(data[2]) << 8) | ord(data[3])
-                if req_obj.req_type == RRQ:
-                    self.send_block(req_obj, last_received)
+                # Check if ACK is for a current ReadClient.
+                read_client = self.clients[addr_string]
+                if isinstance(read_client, ReadClient):
+                    # Interpret last received block. This number is in two separate bytes, 
+                    # so we have to rejoin them.
+                    last_received = (ord(data[2]) << 8) | ord(data[3])
+                    self.send_block(read_client, last_received)
         elif opcode == OP_ERROR:
-            print "error received from " + addr_string
+            error_msg = ERROR_MSGS[UNDEF_ERR]
+            self.sock.sendto(error_msg, address)
 
-class RequestObject:
-    def __init__(self, address, file_buffer, req_type):
-        # TODO: Change from file_object to a buffer.
+    def create_readclient(self, address, header):
+        """Creates a ReadClient object"""
+        addr_string = repr(address)
+        file_name = self.root + "/" + header[0]
+        file_format = header[1]
+
+        # By default, we read in "netascii", or 'r' mode. Otherwise
+        # we read binary in "octet" mode.
+        mode = "r"
+        if file_format == "octet":
+            mode = "rb"
+        try: 
+            # Open file and read into a buffer.
+            file_object = open(file_name, mode)
+            file_buffer = file_object.read()
+            file_object.close()
+
+            # Create a request object.
+            read_client = ReadClient(address, file_buffer)
+            if addr_string in self.clients:
+                self.clients.pop(addr_string, None)
+            self.clients[addr_string] = read_client
+            self.send_block(read_client)
+        except (IOError, OSError) as e:
+            # Print out our error and send an ERROR response.
+            print e
+            error_msg = ERROR_MSGS[NOT_FOUND_ERR]
+            self.sock.sendto(error_msg, address)
+
+    def send_block(self, read_client, last_received=-1):
+        current_blockno = read_client.blockno
+        if current_blockno == last_received:
+            # If the last block was confirmed received, we increment the block #.
+            current_blockno += 1
+            read_client.blockno = current_blockno
+
+        # Get next block and read request's address.
+        address = read_client.address
+        next_block = read_client.get_nextblock()
+        if next_block is None:
+            self.clients.pop(repr(address), None)
+        else:
+            first_byte = current_blockno >> 8
+            second_byte = current_blockno & 0xFF
+            payload = DATA_PACKET.format(chr(first_byte), chr(second_byte), next_block)
+            print "blockno: {0:d}, payload length: {1:d}".format(current_blockno, len(payload))
+            print "block: {}".format(next_block)
+            self.sock.sendto(payload, address)
+
+
+class Client:
+    def __init__(self, address):
         self.address = address
-        self.file_buffer = file_buffer
-        self.next_block = ""
-        self.blockno = 1
-        self.req_type = req_type
         self.complete = False
 
-    def get_nextblock(self):
-        if self.req_type == RRQ:
-            file_buffer = self.file_buffer
-            length = len(file_buffer)
-            blockno = self.blockno
-            if not self.complete:
-                if blockno * DEFAULT_BLKSIZE > length:
-                    self.complete = True
-                    return file_buffer[:blockno*DEFAULT_BLKSIZE]
-                else:
-                    return file_buffer[(blockno-1)*DEFAULT_BLKSIZE: blockno*DEFAULT_BLKSIZE]
-            else:
-                return None
+class ReadClient(Client):
+    def __init__(self, address, file_buffer):
+        Client.__init__(self, address)
+        self.file_buffer = file_buffer
+        self.blockno = 1
 
-    def incr_blockno(self):
-        if self.req_type == RRQ:
-            self.blockno += 1
+    def get_nextblock(self):
+        file_buffer = self.file_buffer
+        length = len(file_buffer)
+        blockno = self.blockno
+        if not self.complete:
+            lower, upper = (blockno - 1) * DEFAULT_BLKSIZE, blockno * DEFAULT_BLKSIZE
+            if upper > length:
+                self.complete = True
+                return file_buffer[lower:]
+            else:
+                return file_buffer[lower:upper]
+        else:
+            return None
 
 if __name__ == "__main__":
     server = TFTPServer()
