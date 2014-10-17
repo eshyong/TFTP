@@ -100,11 +100,15 @@ class TFTPServer:
         elif opcode == OP_DATA:
             try:
                 # Check if DATA is for a current WriteClient.
-                write_client = self.clients[addr_string]
-                if isinstance(write_client, WriteClient):
+                client = self.clients[addr_string]
+                if isinstance(client, WriteClient) and not client.complete:
+                    # Send an ACK for this packet.
                     blockno = (ord(data[2]) << 8) | ord(data[3])
                     block = data[4:]
-                    self.send_ack(write_client, blockno, block)
+                    self.send_ack(client, blockno, block)
+                else:
+                    # Remove ErrorClients and completed requests.
+                    self.clients.pop(client, None)
             except KeyError as e:
                 print e
                 error_msg = ERROR_MSGS[TID_ERR]
@@ -112,12 +116,14 @@ class TFTPServer:
         elif opcode == OP_ACK:
             try:
                 # Check if ACK is for a current ReadClient.
-                read_client = self.clients[addr_string]
-                if isinstance(read_client, ReadClient):
-                    # Interpret last received block. This number is in two separate bytes, 
-                    # so we have to rejoin them.
+                client = self.clients[addr_string]
+                if isinstance(client, ReadClient) and not client.complete:
+                    # Interpret last block received and send next block.
                     last_received = (ord(data[2]) << 8) | ord(data[3])
-                    self.send_block(read_client, last_received)
+                    self.send_block(client, last_received)
+                else:
+                    # Remove ErrorClients and completed requests.
+                    self.clients.pop(client, None)
             except KeyError as e:
                 print e
                 error_msg = ERROR_MSGS[TID_ERR]
@@ -155,6 +161,12 @@ class TFTPServer:
         except (IOError, OSError) as e:
             # Print out our error and send an ERROR response.
             print e
+
+            # Create a dummy client for handling acks, otherwise we get a KeyError.
+            error_client = ErrorClient(address)
+            self.clients[repr(address)] = error_client
+
+            # Send our error message.
             error_msg = ERROR_MSGS[NOT_FOUND_ERR]
             self.sock.sendto(error_msg, address)
 
@@ -172,16 +184,20 @@ class TFTPServer:
             self.clients[repr(address)] = write_client
 
             # Send an ACK with block number 0.
-            ack = ACK_PACKET.format(chr(OP_NULL), chr(OP_NULL))
-            print "ack: ", ack
-            self.sock.sendto(ack, address)
+            packet = ACK_PACKET.format(chr(OP_NULL), chr(OP_NULL))
         except (IOError, OSError) as e:
             # Print out error and send an ERROR response
             print e
             
+            # Create a dummy client for handling acks, otherwise we get a KeyError.
+            error_client = ErrorClient(address)
+            self.clients[repr(address)] = error_client
+
             # TODO: Handle different IOErrors here. 
-            error_msg = ERROR_MSGS[DISK_ERR]
-            self.sock.sendto(error_msg, address)
+            packet = ERROR_MSGS[DISK_ERR]
+
+        # Send an ack packet on success and error otherwise.
+        self.sock.sendto(packet, address)
 
     def send_block(self, read_client, last_received=0):
         """Sends the next block to a ReadClient object."""
@@ -192,12 +208,12 @@ class TFTPServer:
 
         # Get next block to send to client.
         address = read_client.address
-        next_block = read_client.get_nextblock()
         blksize = read_client.blksize
+        next_block = read_client.get_nextblock()
 
         # If blocksize is less than DEFAULT_BLKSIZE, then this is the last block.
         if len(next_block) < blksize:
-            self.clients.pop(repr(address), None)
+            read_client.complete = True
 
         # Format block # as a 2 byte char string.
         first_byte = current_blockno >> 8
@@ -205,13 +221,10 @@ class TFTPServer:
 
         # Send a formatted payload.
         payload = DATA_PACKET.format(chr(first_byte), chr(second_byte), next_block)
-        print "blockno: {0:d}, payload length: {1:d}".format(current_blockno, len(payload))
-        print "block: {}".format(next_block)
         self.sock.sendto(payload, address)
 
     def send_ack(self, write_client, blockno, block):
         address = write_client.address
-        print "Writing block {0:d}: {1}".format(blockno, block)
         error_code = write_client.write_nextblock(block)
         if bool(error_code):
             # TODO: Handle multiple errors.
@@ -219,9 +232,8 @@ class TFTPServer:
             msg = ERROR_MSGS[DISK_ERR]
         else:
             if len(block) < write_client.blksize:
-                # This is the last block, so we close file handles and remove the client from our list.
-                write_client.cleanup()
-                self.clients.pop(repr(address), None)
+                # This is the last block, so we set complete to true.
+                write_client.complete = True
 
             # Write success, send an acknowledgement packet.
             write_client.last_received = blockno
@@ -235,6 +247,7 @@ class Client:
        clients of Read Requests and Write Requests, respectively."""
     def __init__(self, address):
         self.address = address
+        self.complete = False
 
 class ReadClient(Client):
     """Read clients are formed from Read Requests of the form `get filename`.
@@ -280,6 +293,11 @@ class WriteClient(Client):
 
     def cleanup(self):
         self.file_handle.close()
+
+class ErrorClient(Client):
+    def __init__(self, address):
+        Client.__init__(self, address)
+        self.complete = True
 
 if __name__ == "__main__":
     server = TFTPServer()
