@@ -81,10 +81,11 @@ class TFTPServer:
         if len(data) < 4:
             print("request length too short")
             error_msg = ERROR_MSGS[PROTOCOL_ERR]
-
+            self.sock.sendto(error_msg, address)
+            return
 
         addr_string = repr(address)
-        print "\nraw packet: ", list(data)
+        # print "\nraw packet: ", list(data)
 
         # Figure out what the request was, and handle it accordingly.
         # Ignore first byte (it's irrelevant anyway)
@@ -97,10 +98,19 @@ class TFTPServer:
             header = data[2:].split(chr(OP_NULL))
             self.create_writeclient(address, header)
         elif opcode == OP_DATA:
-            error_msg = ERROR_MSGS[NOT_IMPL_ERR]
-            self.sock.sendto(error_msg, address)
+            try:
+                # Check if DATA is for a current WriteClient.
+                write_client = self.clients[addr_string]
+                if isinstance(write_client, WriteClient):
+                    blockno = (ord(data[2]) << 8) | ord(data[3])
+                    block = data[4:]
+                    self.send_ack(write_client, blockno, block)
+            except KeyError as e:
+                print e
+                error_msg = ERROR_MSGS[TID_ERR]
+                self.sock.sendto(error_msg, address)
         elif opcode == OP_ACK:
-            if addr_string in self.clients:
+            try:
                 # Check if ACK is for a current ReadClient.
                 read_client = self.clients[addr_string]
                 if isinstance(read_client, ReadClient):
@@ -108,6 +118,10 @@ class TFTPServer:
                     # so we have to rejoin them.
                     last_received = (ord(data[2]) << 8) | ord(data[3])
                     self.send_block(read_client, last_received)
+            except KeyError as e:
+                print e
+                error_msg = ERROR_MSGS[TID_ERR]
+                self.sock.sendto(error_msg, address)
         elif opcode == OP_ERROR:
             error_msg = ERROR_MSGS[NOT_IMPL_ERR]
             self.sock.sendto(error_msg, address)
@@ -159,7 +173,7 @@ class TFTPServer:
 
             # Send an ACK with block number 0.
             ack = ACK_PACKET.format(chr(OP_NULL), chr(OP_NULL))
-            print "ack: ", list(ack)
+            print "ack: ", ack
             self.sock.sendto(ack, address)
         except (IOError, OSError) as e:
             # Print out error and send an ERROR response
@@ -169,11 +183,11 @@ class TFTPServer:
             error_msg = ERROR_MSGS[DISK_ERR]
             self.sock.sendto(error_msg, address)
 
-    def send_block(self, read_client, last_received=-1):
+    def send_block(self, read_client, last_received=0):
         """Sends the next block to a ReadClient object."""
         current_blockno = read_client.blockno
         if current_blockno == last_received:
-            # If the last block was confirmed received, we increment the block #.
+            # If the last block was confirmed received, we increment the block number.
             current_blockno = read_client.incr_blockno()
 
         # Get next block to send to client.
@@ -195,20 +209,25 @@ class TFTPServer:
         print "block: {}".format(next_block)
         self.sock.sendto(payload, address)
 
-    def send_ack(self, write_client, block):
+    def send_ack(self, write_client, blockno, block):
         address = write_client.address
-        if len(block) < write_client.blksize:
-            self.clients.pop(repr(address), None)
+        print "Writing block {0:d}: {1}".format(blockno, block)
         error_code = write_client.write_nextblock(block)
         if bool(error_code):
             # TODO: Handle multiple errors.
+            print "Write failed!"
             msg = ERROR_MSGS[DISK_ERR]
         else:
-            last_received = write_client.incr_lastrecv()
-            first_byte = last_received >> 8
-            second_byte = last_received & 0xFF
-            msg = ACK_PACKET.format(first_byte, second_byte)
+            if len(block) < write_client.blksize:
+                # This is the last block, so we close file handles and remove the client from our list.
+                write_client.cleanup()
+                self.clients.pop(repr(address), None)
 
+            # Write success, send an acknowledgement packet.
+            write_client.last_received = blockno
+            first_byte = blockno >> 8
+            second_byte = blockno & 0xFF
+            msg = ACK_PACKET.format(chr(first_byte), chr(second_byte))
         self.sock.sendto(msg, address)
 
 class Client:
@@ -244,10 +263,11 @@ class ReadClient(Client):
         return self.blockno
 
 class WriteClient(Client):
-    def __init__(self, address, file_handle):
+    def __init__(self, address, file_handle, blksize=DEFAULT_BLKSIZE):
         Client.__init__(self, address)
         self.file_handle = file_handle
         self.last_received = 0
+        self.blksize = blksize
 
     def write_nextblock(self, block):
         try:
@@ -257,10 +277,6 @@ class WriteClient(Client):
             # TODO: Handle exception somehow.
             print e
             return e.errno
-
-    def incr_lastrecv(self):
-        self.last_received += 1
-        return self.last_received
 
     def cleanup(self):
         self.file_handle.close()
